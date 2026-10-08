@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from .writer import InsecureTargetError, TargetBinding, bind_target
 
@@ -29,9 +30,11 @@ _CONFIG_KEYS = frozenset(
         "profiles",
         "mini_app_enabled",
         "delivery",
+        "public_origin",
+        "trust_roots",
     }
 )
-_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {"mini_app_enabled", "allowed_telegram_user_ids", "allowed_owners", "delivery"}
+_REQUIRED_CONFIG_KEYS = _CONFIG_KEYS - {"mini_app_enabled", "allowed_telegram_user_ids", "allowed_owners", "delivery", "public_origin", "trust_roots"}
 
 def owner_identity(platform: object, user_id: object) -> tuple[str, str] | None:
     """Only canonical platform names and opaque, bounded, exact user IDs qualify."""
@@ -103,6 +106,32 @@ def _ipv4(value: object, field: str) -> str:
     return str(address)
 
 
+def _public_origin(value: object) -> str:
+    if (not isinstance(value, str) or len(value) > 255 or not value.isascii()
+            or '\\' in value or '%' in value
+            or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in value)):
+        raise ConfigError("invalid public_origin")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ConfigError("invalid public_origin") from None
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.path or parsed.query or parsed.fragment or value.endswith('/')
+            or port is not None):
+        raise ConfigError("invalid public_origin")
+    canonical_host = parsed.hostname.lower()
+    labels = canonical_host.split('.')
+    if (len(canonical_host) > 253 or any(
+            not 1 <= len(label) <= 63
+            or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) is None
+            for label in labels)):
+        raise ConfigError("invalid public_origin")
+    if parsed.netloc != canonical_host or f"https://{canonical_host}" != value:
+        raise ConfigError("invalid public_origin")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileConfig:
     name: str
@@ -166,6 +195,8 @@ class IngressConfig:
     profiles: Mapping[str, ProfileConfig]
     mini_app_enabled: bool = False
     delivery: str = 'this_chat'
+    public_origin: str | None = None
+    trust_roots: Path | None = None
 
     @classmethod
     def from_mapping(cls, raw: object) -> "IngressConfig":
@@ -208,6 +239,11 @@ class IngressConfig:
         delivery = raw.get('delivery', 'this_chat')
         if delivery not in ('this_chat', 'home'):
             raise ConfigError('invalid delivery')
+        public_origin = _public_origin(raw['public_origin']) if 'public_origin' in raw else None
+        trust_roots = _absolute_path(raw['trust_roots'], 'trust_roots') if 'trust_roots' in raw else None
+        if public_origin is not None and (
+                listen_host != '127.0.0.1' or public_ip != '127.0.0.1' or trust_roots is None):
+            raise ConfigError('tunnel mode requires loopback TLS and explicit trust roots')
 
         return cls(
             public_ip=public_ip,
@@ -222,6 +258,8 @@ class IngressConfig:
             profiles=MappingProxyType(profiles),
             mini_app_enabled=mini_app_enabled,
             delivery=delivery,
+            public_origin=public_origin,
+            trust_roots=trust_roots,
         )
 
     def resolve(self, name: str, *, hermes_home: Path, expected_uid: int) -> ResolvedProfile:

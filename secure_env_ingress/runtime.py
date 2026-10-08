@@ -48,7 +48,7 @@ class IngressRuntime:
         self.config = IngressConfig.from_mapping(settings)
         self.home = Path(home)
         self._bot_token = bot_token
-        self._trust_roots = trust_roots  # explicit offline-test injection, not a plugin setting
+        self._trust_roots = trust_roots if trust_roots is not None else self.config.trust_roots
         self._lock = threading.RLock()
         self._leader = LeaderLock(self.home)
         self._store = CapabilityStore()
@@ -80,6 +80,8 @@ class IngressRuntime:
         return (int.from_bytes(digest, "big"), target.expected_uid)
 
     def _origin(self):
+        if self.config.public_origin is not None:
+            return self.config.public_origin
         ip = self.config.public_ip
         host = f'[{ip}]' if ':' in ip else ip
         return f'https://{host}:{self.config.listen_port}'
@@ -126,8 +128,11 @@ class IngressRuntime:
 
     def create_vault(self, owner, target: VaultTarget | VaultLoginTarget, *, mode='login'):
         with self._lock:
-            if (self._closed or not isinstance(owner, tuple) or len(owner) != 2
-                    or owner[0] != 'telegram' or owner not in self.config.owners
+            owner_mode_allowed = (
+                isinstance(owner, tuple) and len(owner) == 2 and
+                (owner[0] == 'telegram' or (owner[0] == 'discord' and mode in ('login', 'code')))
+            )
+            if (self._closed or not owner_mode_allowed or owner not in self.config.owners
                     or mode not in ('login', 'code', 'payment')):
                 raise HTTPError(403, 'denied')
             assert_profile_home(self.home)

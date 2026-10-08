@@ -1,11 +1,11 @@
 name: secure-env-ingress
-version: 0.7.5
-description: "Secure ENV: Telegram HTTPS forms for login/password, TOTP keys, payment card storage/protected iframe fill, verification codes/passcodes, .env secrets and trusted operations."
+version: 0.7.5+discord.2
+description: "Secure ENV: Discord and Telegram HTTPS forms for login/password, TOTP keys, and verification codes; Telegram-only payment features remain available when its optional dependency is installed."
 author: web3blind
 python_dependencies:
   - "cryptography>=50.0.0,<51"
   - "python-dotenv>=1.2.2,<2"
-  - "python-telegram-bot>=22.6,<23"
+
 provides_tools:
   - browser_vault
   - secure_payment_fill

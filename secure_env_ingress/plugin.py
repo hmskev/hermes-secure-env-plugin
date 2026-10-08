@@ -18,7 +18,8 @@ from .delivery import Delivery
 
 SETTING_KEYS = ('public_ip', 'listen_host', 'listen_port', 'ttl_seconds',
                 'allowed_telegram_user_ids', 'allowed_owners', 'profiles', 'cert_path',
-                'key_path', 'tls_dir', 'safety_seconds', 'mini_app_enabled', 'delivery')
+                'key_path', 'tls_dir', 'safety_seconds', 'mini_app_enabled', 'delivery',
+                'public_origin', 'trust_roots')
 _CAPTURE = ContextVar('secure_env_gateway_command', default=None)
 
 @dataclass
@@ -144,10 +145,9 @@ def register(ctx):
         token = set_hermes_home_override(selected_home)
         try:
             from hermes_cli.plugins import load_config_readonly
-            from yaml import YAMLError
             try:
                 raw = load_config_readonly() or {}
-            except (OSError, ValueError, YAMLError):
+            except Exception:
                 if not consumer_config:
                     raise
                 # Consumer discovery alone is optional. No exception details or
@@ -343,12 +343,18 @@ def register(ctx):
                     (not {'origin', 'label'}.issubset(args) or set(args) - {'origin', 'label', 'mode', 'selection'}) or
                     args.get('mode', 'login') not in ('login', 'code', 'payment')):
                 raise ValueError('invalid request')
-            code_mode = args.get('mode', 'login') == 'code'
-            payment_mode = args.get('mode', 'login') == 'payment'
+            requested_mode = args.get('mode', 'login')
+            code_mode = requested_mode == 'code'
+            payment_mode = requested_mode == 'payment'
             if 'selection' in args and (not code_mode or not isinstance(args['selection'], str) or len(args['selection']) > 100):
                 raise ValueError('invalid selection')
-            if bound(sc._SESSION_PLATFORM) != 'telegram' or bound(sc._CRON_SESSION) != '':
-                raise ValueError('not an interactive Telegram turn')
+            platform = bound(sc._SESSION_PLATFORM)
+            if platform not in ('telegram', 'discord') or bound(sc._CRON_SESSION) != '':
+                raise ValueError('not an interactive supported gateway turn')
+            # Discord supports task-bound one-use login and verification-code forms.
+            # Payment retains its separate Telegram-only confirmation boundary.
+            if platform == 'discord' and payment_mode:
+                raise ValueError('mode unavailable on Discord')
             from agent.delegation_context import is_delegated_child_context
             if is_delegated_child_context():
                 raise ValueError('delegated turn')
@@ -361,11 +367,15 @@ def register(ctx):
             profile = bound(sc._SESSION_PROFILE)
             from hermes_constants import profile_name_for_home
             expected_profile = profile_name_for_home(home) or 'default'
+            allowed_chat_types = (('dm', 'group', 'forum') if platform == 'telegram'
+                                  else ('dm', 'group', 'thread', 'channel'))
+            owner = (platform, owner_text)
             if (not sid or not skey or not task_id or sid != task_id or
                     (session_id and session_id != sid) or not owner_text or
-                    not owner_text.isdecimal() or ('telegram', owner_text) not in configured_owners(read_settings(home)) or
+                    not owner_text.isascii() or not owner_text.isdecimal() or
+                    owner not in configured_owners(read_settings(home)) or
                     not chat or not str(chat).lstrip('-').isdecimal() or
-                    chat_type not in ('dm', 'group', 'forum') or
+                    chat_type not in allowed_chat_types or
                     profile not in ((expected_profile, '') if expected_profile == 'default' else (expected_profile,))):
                 raise ValueError('session mismatch')
             assert_profile_home(home)
@@ -380,6 +390,12 @@ def register(ctx):
             reason = 'gateway_delivery'
             gateway = gateway_ref() if gateway_ref is not None else None
             if gateway is None:
+                # Agent turns can execute in a plugin registration instance that did
+                # not observe the inbound hook. Use Hermes' canonical in-process
+                # runner reference; destination and owner remain session-bound below.
+                from gateway.run import _gateway_runner_ref
+                gateway = _gateway_runner_ref()
+            if gateway is None:
                 raise ValueError('gateway unavailable')
             runtime = runtime_for(home)
             reason = 'runtime_preflight'
@@ -387,8 +403,8 @@ def register(ctx):
             runtime.refresh(current)
             delivery = Delivery(current.get('delivery', 'this_chat'), home)
             # No model-supplied destination. The actual chat/thread come from bound gateway context.
-            delivery.target('telegram', chat, thread)
-            creation = asyncio.create_task(asyncio.to_thread(runtime.create_vault, ('telegram', owner_text), target,
+            delivery.target(platform, chat, thread)
+            creation = asyncio.create_task(asyncio.to_thread(runtime.create_vault, owner, target,
                                                               **({'mode': args['mode']} if code_mode or payment_mode else {})))
             try:
                 links = await asyncio.shield(creation)
@@ -400,7 +416,7 @@ def register(ctx):
                         'Do not use a public or untrusted chat. Do not forward it. ' +
                         ('Submitting fills the current browser code field, not the site form.' if code_mode else 'Saving stores the card including CVC in encrypted Vault; it does not fill or authorize payment.' if payment_mode else 'Saving does not fill or sign in.'))
                 delivery_task = asyncio.create_task(
-                    delivery.send_gateway(gateway, 'telegram', chat, thread, text))
+                    delivery.send_gateway(gateway, platform, chat, thread, text))
                 try:
                     await asyncio.wait_for(asyncio.shield(delivery_task),
                                            timeout=min(18, max(0, links['expires_at'] - time.monotonic())))
@@ -461,7 +477,7 @@ def register(ctx):
             raise
         except BaseException:
             return json.dumps({'success': False, 'reason': reason,
-                'error': 'Form unavailable. Check the active Telegram session, browser page, delivery and HTTPS setup.'})
+                'error': 'Form unavailable. Check the active gateway session, browser page, delivery and HTTPS setup.'})
 
     async def operation_tool(args, *, task_id=None, session_id=None, **_kwargs):
         """No browser dependency; allowlist binding precedes capability issuance."""
@@ -511,6 +527,12 @@ def register(ctx):
                 (int.from_bytes(identity, 'big'), 0), skey, str(chat), str(thread or ''))
             reason = 'gateway_delivery'
             gateway = gateway_ref() if gateway_ref is not None else None
+            if gateway is None:
+                # Agent turns can execute in a plugin registration instance that did
+                # not observe the inbound hook. Use Hermes' canonical in-process
+                # runner reference; destination and owner remain session-bound below.
+                from gateway.run import _gateway_runner_ref
+                gateway = _gateway_runner_ref()
             if gateway is None:
                 raise ValueError('gateway unavailable')
             delivery = Delivery(current.get('delivery', 'this_chat'), home)
@@ -642,7 +664,7 @@ def register(ctx):
                     'required': ['operation', 'parameters'], 'additionalProperties': False}},
         handler=operation_tool, is_async=True)
     ctx.register_tool(name='browser_vault', toolset='browser',
-        schema={'name': 'browser_vault', 'description': 'Secure ENV: Telegram HTTPS form for login, username, password, optional TOTP setup key, payment card storage, or verification code/passcode. Use mode=login (default) to SAVE credentials for an HTTPS origin in encrypted profile Vault; no open browser required, no automatic filling or sign-in. Later fill the matching site through native Vault tools. Use mode=code to FILL a recognized code/passcode field in an attached browser, without Vault storage or site submission; accepts 4-16 printable ASCII characters including punctuation, no whitespace. A native secret prompt returning prompt_unavailable does NOT establish that this plugin is unavailable: use the matching mode here in an authorized Telegram session. Payment mode saves card fields including CVC in encrypted native Vault for an exact HTTPS origin; no browser required, no fill, no payment authorization. Later native fill needs explicit human payment-fill confirmation; for supported exact hosted-card iframes discover secure_payment_fill, the additive protected plugin path with the same native human consent. Never retry a decline. No mode needs a site-specific registered operation. Never put secrets in arguments or chat. Links grant access to chat readers. For workflow and failure diagnosis load the plugin usage skill.',
+        schema={'name': 'browser_vault', 'description': 'Secure ENV: HTTPS form for login, username, password, optional TOTP setup key, or verification code/passcode in authorized Telegram or Discord sessions; Telegram additionally supports payment-card storage. Use mode=login (default) to SAVE credentials for an HTTPS origin in encrypted profile Vault; no open browser required, no automatic filling or sign-in. Later fill the matching site through native Vault tools. Use mode=code to FILL a recognized code/passcode field in an attached task-bound browser, without Vault storage or site submission; accepts 4-16 printable ASCII characters including punctuation, no whitespace. A native secret prompt returning prompt_unavailable does NOT establish that this plugin is unavailable: use the matching mode here in an authorized Telegram or Discord session. Payment mode is Telegram-only and saves card fields including CVC in encrypted native Vault for an exact HTTPS origin; no browser required, no fill, no payment authorization. Later native fill needs explicit human payment-fill confirmation; for supported exact hosted-card iframes discover secure_payment_fill, the additive protected plugin path with the same native human consent. Never retry a decline. No mode needs a site-specific registered operation. Never put secrets in arguments or chat. Links grant access to chat readers. For workflow and failure diagnosis load the plugin usage skill.',
                 'parameters': {'type': 'object', 'properties': {'origin': {'type': 'string', 'description': 'Exact HTTPS origin to store credentials for; for code mode, the current page origin. No path or trailing slash.'},
                     'label': {'type': 'string', 'description': 'Short public site label'},
                     'selection': {'type': 'string', 'description': 'Code mode only: opaque candidate returned by selection_required. Hermes chooses using its login context; never ask the user to identify a tab.'},

@@ -5,7 +5,7 @@ description: Use Secure ENV for Telegram login/password, payment card storage/pr
 
 # Secure ENV: choose the right protected form
 
-This plugin provides Telegram HTTPS forms. It is separate from native interactive Vault prompts. Load the installed `browser_vault` tool schema before calling it. Search for `Secure ENV login password` or `Secure ENV verification code` when tools are deferred. Do not conclude that the plugin is unavailable because a native prompt returned `prompt_unavailable`.
+This plugin provides Telegram and Discord HTTPS forms. It is separate from native interactive Vault prompts. Load the installed `browser_vault` tool schema before calling it. Search for `Secure ENV login password` or `Secure ENV verification code` when tools are deferred. Do not conclude that the plugin is unavailable because a native prompt returned `prompt_unavailable`.
 
 ## Login and password — not code mode
 
